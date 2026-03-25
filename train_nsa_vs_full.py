@@ -1,486 +1,690 @@
 """
-NSA vs Full Attention — Training Comparison on WikiText-2
-=========================================================
-Self-contained script for Google Colab Free (T4 GPU).
-No Triton / flash-attn / fla dependency — pure PyTorch.
+Colab-friendly comparison between full attention and a pure-PyTorch NSA reference.
 
-Implements the three NSA branches from the paper:
-  1. Compression  (mean-pooled block keys/values)
-  2. Selection    (top-k block selection based on compression scores)
-  3. Sliding Window (local causal window)
-Combined via learned sigmoid gates, compared against standard causal attention.
-
-Usage on Colab:
-  1.  !pip install -q datasets transformers matplotlib tqdm
-  2.  Optional: export NSA_OUTPUT_DIR=/path/to/outputs  (default: current dir)
-  3.  python train_nsa_vs_full.py
+The NSA path uses `native_sparse_attention.pytorch_reference.ReferenceNativeSparseAttention`
+and avoids Triton / flash-attn / fla dependencies.
 """
 
-import math
-import time
+from __future__ import annotations
+
 import copy
 import json
+import math
 import os
-
-import matplotlib
-
-matplotlib.use("Agg")  # headless (Colab subprocess, serveurs sans display)
+import random
+import time
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Callable, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
-
-import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device: {DEVICE}")
+from native_sparse_attention.pytorch_reference import (
+    ReferenceNativeSparseAttention,
+    apply_rope,
+    precompute_rope,
+)
 
-# ============================================================
-# Configuration
-# ============================================================
-class Cfg:
-    # --- model ---
-    vocab_size:    int = 50257        # GPT-2 tokenizer
-    hidden_size:   int = 256
-    num_heads:     int = 8
-    head_dim:      int = 32           # hidden_size // num_heads
-    num_layers:    int = 6
-    mlp_hidden:    int = 512
-    max_seq_len:   int = 512
-    dropout:       float = 0.1
 
-    # --- NSA ---
-    block_size:    int = 64           # compression / selection block size
-    block_counts:  int = 4            # top-k blocks per query
-    window_size:   int = 128          # sliding-window width
+ProgressCallback = Callable[[dict[str, Any]], None]
 
-    # --- training ---
-    batch_size:    int = 8
-    lr:            float = 5e-4
-    weight_decay:  float = 0.1
-    epochs:        int = 5
-    warmup_steps:  int = 200
-    eval_every:    int = 100          # evaluate every N steps
-    grad_clip:     float = 1.0
-    seed:          int = 42
 
-CFG = Cfg()
+@dataclass
+class ExperimentConfig:
+    tokenizer_name: str = "gpt2"
+    dataset_name: str = "wikitext"
+    dataset_config: str = "wikitext-2-raw-v1"
+    text_field: str = "text"
+    vocab_size: int = 50257
 
-# ============================================================
-# Building blocks
-# ============================================================
+    hidden_size: int = 256
+    num_heads: int = 8
+    num_layers: int = 4
+    mlp_hidden: int = 1024
+    max_seq_len: int = 256
+    dropout: float = 0.0
+
+    block_size: int = 32
+    block_counts: int = 4
+    window_size: int = 64
+
+    batch_size: int = 8
+    lr: float = 3e-4
+    weight_decay: float = 0.1
+    epochs: int = 2
+    warmup_steps: int = 20
+    eval_every: int = 20
+    grad_clip: float = 1.0
+    seed: int = 42
+
+    max_train_chunks: int = 512
+    max_val_chunks: int = 128
+    smoothing_window: int = 20
+    zero_init_nsa_gates: bool = True
+    device: Optional[str] = None
+
+    @property
+    def head_dim(self) -> int:
+        if self.hidden_size % self.num_heads != 0:
+            raise ValueError("hidden_size must be divisible by num_heads")
+        return self.hidden_size // self.num_heads
+
+
 class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, x):
-        rms = x.float().pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
-        return (x * rms).type_as(x) * self.weight
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+        return (x * rms).type_as(x) * self.weight.type_as(x)
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, dim, hidden):
+    def __init__(self, dim: int, hidden: int) -> None:
         super().__init__()
         self.w1 = nn.Linear(dim, hidden, bias=False)
         self.w3 = nn.Linear(dim, hidden, bias=False)
         self.w2 = nn.Linear(hidden, dim, bias=False)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 
-def precompute_rope(dim, max_len=4096, theta=10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    t = torch.arange(max_len, dtype=torch.float32)
-    angles = torch.outer(t, freqs)
-    return angles.cos(), angles.sin()
-
-
-def apply_rope(x, cos, sin):
-    """x: [B, H, T, D]  —  cos/sin: [max_len, D//2]"""
-    T = x.shape[2]
-    c = cos[:T].unsqueeze(0).unsqueeze(0)          # [1, 1, T, D//2]
-    s = sin[:T].unsqueeze(0).unsqueeze(0)
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1)
-
-
-# ============================================================
-# Full Causal Attention
-# ============================================================
 class FullAttention(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg: ExperimentConfig) -> None:
         super().__init__()
         dim = cfg.hidden_size
-        self.H = cfg.num_heads
-        self.D = cfg.head_dim
-        self.scale = self.D ** -0.5
+        self.num_heads = cfg.num_heads
+        self.head_dim = cfg.head_dim
+        self.scale = self.head_dim ** -0.5
 
-        self.q_proj = nn.Linear(dim, self.H * self.D, bias=False)
-        self.k_proj = nn.Linear(dim, self.H * self.D, bias=False)
-        self.v_proj = nn.Linear(dim, self.H * self.D, bias=False)
-        self.o_proj = nn.Linear(self.H * self.D, dim, bias=False)
+        self.q_proj = nn.Linear(dim, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(dim, self.num_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, self.num_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, dim, bias=False)
         self.attn_drop = nn.Dropout(cfg.dropout)
 
-    def forward(self, x, rope_cos, rope_sin):
-        B, T, _ = x.shape
-        q = self.q_proj(x).view(B, T, self.H, self.D).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.H, self.D).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.H, self.D).transpose(1, 2)
+    def forward(self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        q = self.q_proj(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
 
-        q, k = apply_rope(q, rope_cos, rope_sin), apply_rope(k, rope_cos, rope_sin)
+        q = apply_rope(q, rope_cos, rope_sin)
+        k = apply_rope(k, rope_cos, rope_sin)
 
-        att = (q @ k.transpose(-1, -2)) * self.scale
-        causal = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), 1)
+        att = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        causal = torch.triu(torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool), diagonal=1)
         att = att.masked_fill(causal, float("-inf"))
         att = self.attn_drop(F.softmax(att, dim=-1))
 
-        out = (att @ v).transpose(1, 2).reshape(B, T, -1)
+        out = torch.matmul(att, v).transpose(1, 2).reshape(batch_size, seq_len, -1)
         return self.o_proj(out)
 
 
-# ============================================================
-# Native Sparse Attention (pure-PyTorch, mask-based)
-# ============================================================
-class NSAAttention(nn.Module):
-    """
-    Faithful implementation of NSA's three branches:
-      • Compression:     attend to mean-pooled block representations
-      • Selection:       top-k block selection guided by compression scores
-      • Sliding window:  local causal window
-    Combined through learned per-head sigmoid gates.
-    """
-
-    def __init__(self, cfg):
-        super().__init__()
-        dim = cfg.hidden_size
-        self.H = cfg.num_heads
-        self.D = cfg.head_dim
-        self.scale = self.D ** -0.5
-        self.BS = cfg.block_size
-        self.N_SEL = cfg.block_counts
-        self.W = cfg.window_size
-
-        self.q_proj = nn.Linear(dim, self.H * self.D, bias=False)
-        self.k_proj = nn.Linear(dim, self.H * self.D, bias=False)
-        self.v_proj = nn.Linear(dim, self.H * self.D, bias=False)
-        self.o_proj = nn.Linear(self.H * self.D, dim, bias=False)
-        self.g_proj = nn.Linear(dim, self.H * 3, bias=False)
-        self.attn_drop = nn.Dropout(cfg.dropout)
-
-    def forward(self, x, rope_cos, rope_sin):
-        B, T, _ = x.shape
-        BS, H, D = self.BS, self.H, self.D
-        C = T // BS                          # number of compression blocks
-
-        q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)   # [B,H,T,D]
-        k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
-        q, k = apply_rope(q, rope_cos, rope_sin), apply_rope(k, rope_cos, rope_sin)
-
-        gates = self.g_proj(x).view(B, T, H, 3).permute(0, 2, 1, 3).sigmoid()
-        g_cmp, g_slc, g_swa = gates.unbind(-1)   # each [B,H,T]
-
-        t_idx = torch.arange(T, device=x.device)
-        c_idx = torch.arange(C, device=x.device)
-
-        # ---- 1. Compression branch ----
-        k_cmp = k.view(B, H, C, BS, D).mean(3)   # [B,H,C,D]
-        v_cmp = v.view(B, H, C, BS, D).mean(3)
-
-        att_cmp = (q @ k_cmp.transpose(-1, -2)) * self.scale       # [B,H,T,C]
-        # causal: query t may use block c only when all of c's tokens have been seen
-        cmp_ok = t_idx.unsqueeze(1) >= (c_idx.unsqueeze(0) + 1) * BS  # [T,C]
-        att_cmp = att_cmp.masked_fill(~cmp_ok.unsqueeze(0).unsqueeze(0), float("-inf"))
-        w_cmp = F.softmax(att_cmp, dim=-1).nan_to_num(0)              # [B,H,T,C]
-        o_cmp = self.attn_drop(w_cmp) @ v_cmp                         # [B,H,T,D]
-
-        # ---- 2. Selection branch ----
-        # block importance = compression attention weight  (detached — no grad through selection)
-        blk_imp = w_cmp.detach().clone()
-        # the block containing the query always gets high importance (cf. paper §3.3.2)
-        local_blk = t_idx // BS                                       # [T]
-        local_eq  = c_idx.unsqueeze(0) == local_blk.unsqueeze(1)      # [T,C]
-        blk_imp   = blk_imp.masked_fill(local_eq.unsqueeze(0).unsqueeze(0), 1.0)
-
-        n = min(self.N_SEL, C)
-        _, top_c = blk_imp.topk(n, dim=-1)                            # [B,H,T,n]
-
-        # scatter into [B,H,T,C] bool → expand to token-level [B,H,T,T]
-        sel = torch.zeros(B, H, T, C, dtype=torch.bool, device=x.device)
-        sel.scatter_(3, top_c, True)
-        pos_blk = t_idx // BS                                         # [T]
-        slc_mask = sel[..., pos_blk]                                   # [B,H,T,T]
-        causal_2d = t_idx.unsqueeze(0) <= t_idx.unsqueeze(1)          # [T,T]
-        slc_mask  = slc_mask & causal_2d.unsqueeze(0).unsqueeze(0)
-
-        att_raw = (q @ k.transpose(-1, -2)) * self.scale              # [B,H,T,T]
-        att_slc = att_raw.masked_fill(~slc_mask, float("-inf"))
-        w_slc   = F.softmax(att_slc, dim=-1).nan_to_num(0)
-        o_slc   = self.attn_drop(w_slc) @ v                           # [B,H,T,D]
-
-        # ---- 3. Sliding-window branch ----
-        diff = t_idx.unsqueeze(1) - t_idx.unsqueeze(0)                # [T,T]
-        swa_mask = (diff >= 0) & (diff < self.W)
-        att_swa = att_raw.masked_fill(~swa_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-        w_swa   = F.softmax(att_swa, dim=-1).nan_to_num(0)
-        o_swa   = self.attn_drop(w_swa) @ v                           # [B,H,T,D]
-
-        # ---- gated combination ----
-        out = (g_cmp.unsqueeze(-1) * o_cmp
-             + g_slc.unsqueeze(-1) * o_slc
-             + g_swa.unsqueeze(-1) * o_swa)
-
-        out = out.transpose(1, 2).reshape(B, T, -1)
-        return self.o_proj(out)
-
-
-# ============================================================
-# Transformer block + Language model
-# ============================================================
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg, attn_cls):
+    def __init__(self, cfg: ExperimentConfig, attn_cls: type[nn.Module]) -> None:
         super().__init__()
-        self.ln1  = RMSNorm(cfg.hidden_size)
+        self.ln1 = RMSNorm(cfg.hidden_size)
         self.attn = attn_cls(cfg)
-        self.ln2  = RMSNorm(cfg.hidden_size)
-        self.mlp  = SwiGLU(cfg.hidden_size, cfg.mlp_hidden)
+        self.ln2 = RMSNorm(cfg.hidden_size)
+        self.mlp = SwiGLU(cfg.hidden_size, cfg.mlp_hidden)
 
-    def forward(self, x, rope_cos, rope_sin):
+    def forward(self, x: torch.Tensor, rope_cos: torch.Tensor, rope_sin: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(self.ln1(x), rope_cos, rope_sin)
         x = x + self.mlp(self.ln2(x))
         return x
 
 
 class SmallLM(nn.Module):
-    def __init__(self, cfg, attn_cls):
+    def __init__(self, cfg: ExperimentConfig, attn_cls: type[nn.Module]) -> None:
         super().__init__()
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.hidden_size)
-        self.drop    = nn.Dropout(cfg.dropout)
-        self.blocks  = nn.ModuleList(
-            [TransformerBlock(cfg, attn_cls) for _ in range(cfg.num_layers)]
-        )
-        self.ln_f    = RMSNorm(cfg.hidden_size)
-        self.head    = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
-        self.tok_emb.weight = self.head.weight         # weight tying
+        self.drop = nn.Dropout(cfg.dropout)
+        self.blocks = nn.ModuleList(TransformerBlock(cfg, attn_cls) for _ in range(cfg.num_layers))
+        self.ln_f = RMSNorm(cfg.hidden_size)
+        self.head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.head.weight = self.tok_emb.weight
 
         rope_cos, rope_sin = precompute_rope(cfg.head_dim, cfg.max_seq_len + 64)
         self.register_buffer("rope_cos", rope_cos)
         self.register_buffer("rope_sin", rope_sin)
 
         self.apply(self._init_weights)
-        # scaled residual init (GPT-2 style)
         for blk in self.blocks:
             nn.init.normal_(blk.attn.o_proj.weight, std=0.02 / math.sqrt(2 * cfg.num_layers))
-            nn.init.normal_(blk.mlp.w2.weight,      std=0.02 / math.sqrt(2 * cfg.num_layers))
+            nn.init.normal_(blk.mlp.w2.weight, std=0.02 / math.sqrt(2 * cfg.num_layers))
 
     @staticmethod
-    def _init_weights(m):
-        if isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.Embedding):
-            nn.init.normal_(m.weight, std=0.02)
+    def _init_weights(module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, std=0.02)
 
-    def forward(self, idx):
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
         x = self.drop(self.tok_emb(idx))
         for blk in self.blocks:
             x = blk(x, self.rope_cos, self.rope_sin)
         return self.head(self.ln_f(x))
 
-    def param_count(self):
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+    def param_count(self) -> int:
+        return sum(param.numel() for param in self.parameters() if param.requires_grad)
 
 
-# ============================================================
-# Dataset: WikiText-2 (tokenised with GPT-2 tokenizer)
-# ============================================================
-def load_data(cfg):
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def get_device(name: Optional[str] = None) -> torch.device:
+    if name is not None:
+        return torch.device(name)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def sync_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def load_data(cfg: ExperimentConfig) -> tuple[torch.Tensor, torch.Tensor]:
     from datasets import load_dataset
     from transformers import AutoTokenizer
 
-    print("Loading WikiText-2 …")
-    ds  = load_dataset("wikitext", "wikitext-2-raw-v1")
-    tok = AutoTokenizer.from_pretrained("gpt2")
+    print(f"Loading {cfg.dataset_name}/{cfg.dataset_config} with tokenizer {cfg.tokenizer_name}")
+    dataset = load_dataset(cfg.dataset_name, cfg.dataset_config)
+    tokenizer = AutoTokenizer.from_pretrained(cfg.tokenizer_name)
 
-    def encode_split(split):
-        ids = []
-        for line in split["text"]:
-            if line.strip():
-                ids.extend(tok.encode(line))
-        length = cfg.max_seq_len + 1        # +1 for next-token target
-        n = len(ids) // length
-        return torch.tensor(ids[: n * length], dtype=torch.long).view(n, length)
+    def encode_split(split_name: str, max_chunks: int) -> torch.Tensor:
+        token_ids: list[int] = []
+        for text in dataset[split_name][cfg.text_field]:
+            stripped = text.strip()
+            if not stripped:
+                continue
+            token_ids.extend(tokenizer.encode(stripped + "\n", add_special_tokens=False))
 
-    train_t = encode_split(ds["train"])
-    val_t   = encode_split(ds["validation"])
-    print(f"  train chunks: {len(train_t):,}  |  val chunks: {len(val_t):,}")
-    return train_t, val_t
+        chunk_len = cfg.max_seq_len + 1
+        available_chunks = len(token_ids) // chunk_len
+        used_chunks = min(available_chunks, max_chunks)
+        if used_chunks == 0:
+            raise RuntimeError(f"No chunks available for split {split_name}")
+
+        usable_tokens = used_chunks * chunk_len
+        return torch.tensor(token_ids[:usable_tokens], dtype=torch.long).reshape(used_chunks, chunk_len)
+
+    train_tokens = encode_split("train", cfg.max_train_chunks)
+    val_tokens = encode_split("validation", cfg.max_val_chunks)
+    print(
+        f"Prepared {len(train_tokens):,} train chunks and {len(val_tokens):,} validation chunks "
+        f"with sequence length {cfg.max_seq_len}"
+    )
+    return train_tokens, val_tokens
 
 
-# ============================================================
-# Training utilities
-# ============================================================
-def cosine_lr(step, warmup, total, lr):
-    if step < warmup:
-        return lr * step / max(warmup, 1)
-    progress = (step - warmup) / max(total - warmup, 1)
-    return lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+def make_loader(
+    tensor: torch.Tensor,
+    batch_size: int,
+    shuffle: bool,
+    seed: int,
+) -> DataLoader:
+    generator = torch.Generator().manual_seed(seed)
+    return DataLoader(
+        TensorDataset(tensor),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        generator=generator,
+    )
+
+
+def cosine_lr(step: int, warmup_steps: int, total_steps: int, base_lr: float) -> float:
+    if step < warmup_steps:
+        return base_lr * step / max(warmup_steps, 1)
+    progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+
+def smooth_curve(values: list[float], window: int) -> list[float]:
+    if not values:
+        return []
+    smoothed: list[float] = []
+    for idx in range(len(values)):
+        start = max(0, idx - window + 1)
+        chunk = values[start : idx + 1]
+        smoothed.append(sum(chunk) / len(chunk))
+    return smoothed
+
+
+def maybe_autocast(device: torch.device):
+    if device.type == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.float16)
+    return nullcontext()
 
 
 @torch.no_grad()
-def evaluate(model, loader):
+def evaluate(model: nn.Module, loader: DataLoader, device: torch.device) -> tuple[float, float]:
     model.eval()
-    total_loss, total_tok = 0.0, 0
+    total_loss = 0.0
+    total_tokens = 0
+
+    sync_device(device)
+    start = time.perf_counter()
     for (batch,) in loader:
-        batch = batch.to(DEVICE)
-        x, y = batch[:, :-1], batch[:, 1:]
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=DEVICE.type == "cuda"):
+        batch = batch.to(device)
+        x = batch[:, :-1]
+        y = batch[:, 1:]
+        with maybe_autocast(device):
             logits = model(x)
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1), reduction="sum")
         total_loss += loss.item()
-        total_tok  += y.numel()
+        total_tokens += y.numel()
+    sync_device(device)
+    elapsed = time.perf_counter() - start
+
     model.train()
-    return total_loss / total_tok
+    return total_loss / total_tokens, elapsed
 
 
-def train_model(model, train_loader, val_loader, cfg, label="model"):
+def copy_matching_state(src: nn.Module, dst: nn.Module) -> int:
+    src_state = src.state_dict()
+    dst_state = dst.state_dict()
+    copied = 0
+    for name, tensor in dst_state.items():
+        if name in src_state and src_state[name].shape == tensor.shape:
+            tensor.copy_(src_state[name])
+            copied += 1
+    dst.load_state_dict(dst_state)
+    return copied
+
+
+def init_nsa_gates(model: SmallLM) -> None:
+    for block in model.blocks:
+        if hasattr(block.attn, "g_proj"):
+            nn.init.zeros_(block.attn.g_proj.weight)
+
+
+def progress_snapshot(
+    label: str,
+    history: dict[str, Any],
+    step: int,
+    total_steps: int,
+    epoch: int,
+    lr: float,
+    train_loss: float,
+    val_loss: float,
+    elapsed_sec: float,
+    avg_step_time_sec: float,
+    tokens_per_sec: float,
+    eval_time_sec: float,
+) -> dict[str, Any]:
+    return {
+        "label": label,
+        "step": step,
+        "total_steps": total_steps,
+        "epoch": epoch,
+        "lr": lr,
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+        "elapsed_sec": elapsed_sec,
+        "avg_step_time_sec": avg_step_time_sec,
+        "tokens_per_sec": tokens_per_sec,
+        "eval_time_sec": eval_time_sec,
+        "history": {
+            "train_steps": history["train_steps"][:],
+            "train_loss": history["train_loss"][:],
+            "val_steps": history["val_steps"][:],
+            "val_loss": history["val_loss"][:],
+            "val_elapsed_sec": history["val_elapsed_sec"][:],
+        },
+    }
+
+
+def train_model(
+    model: SmallLM,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    cfg: ExperimentConfig,
+    device: torch.device,
+    label: str,
+    progress_callback: Optional[ProgressCallback] = None,
+    show_progress_bar: bool = True,
+) -> dict[str, Any]:
     model.train()
-    opt = torch.optim.AdamW(
-        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.95)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.lr,
+        betas=(0.9, 0.95),
+        weight_decay=cfg.weight_decay,
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=DEVICE.type == "cuda")
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
     total_steps = cfg.epochs * len(train_loader)
-    step = 0
-    train_losses, val_losses, val_steps = [], [], []
+    if total_steps == 0:
+        raise RuntimeError("Empty train loader")
 
-    val_loss = evaluate(model, val_loader)
-    val_losses.append(val_loss)
-    val_steps.append(0)
-    print(f"[{label}] step 0 — val loss {val_loss:.4f}  ppl {math.exp(val_loss):.1f}")
+    history: dict[str, Any] = {
+        "label": label,
+        "train_steps": [],
+        "train_loss": [],
+        "val_steps": [],
+        "val_loss": [],
+        "val_elapsed_sec": [],
+        "step_time_sec": [],
+        "tokens_per_sec": [],
+    }
+
+    train_start = time.perf_counter()
+    step = 0
+    interval_tokens = 0
+    interval_steps = 0
+    interval_train_time = 0.0
+    total_tokens_seen = 0
+
+    val_loss, eval_time_sec = evaluate(model, val_loader, device)
+    history["val_steps"].append(0)
+    history["val_loss"].append(val_loss)
+    history["val_elapsed_sec"].append(0.0)
+    if progress_callback is not None:
+        progress_callback(
+            progress_snapshot(
+                label=label,
+                history=history,
+                step=0,
+                total_steps=total_steps,
+                epoch=0,
+                lr=0.0,
+                train_loss=float("nan"),
+                val_loss=val_loss,
+                elapsed_sec=0.0,
+                avg_step_time_sec=0.0,
+                tokens_per_sec=0.0,
+                eval_time_sec=eval_time_sec,
+            )
+        )
+    print(f"[{label}] step 0/{total_steps} | val {val_loss:.4f} | ppl {math.exp(val_loss):.2f}")
 
     for epoch in range(1, cfg.epochs + 1):
-        pbar = tqdm(train_loader, desc=f"[{label}] epoch {epoch}/{cfg.epochs}")
-        for (batch,) in pbar:
-            batch = batch.to(DEVICE)
-            x, y = batch[:, :-1], batch[:, 1:]
+        iterator = tqdm(
+            train_loader,
+            desc=f"[{label}] epoch {epoch}/{cfg.epochs}",
+            leave=False,
+            disable=not show_progress_bar,
+        )
+        for (batch,) in iterator:
+            sync_device(device)
+            batch_start = time.perf_counter()
+
+            batch = batch.to(device)
+            x = batch[:, :-1]
+            y = batch[:, 1:]
 
             lr = cosine_lr(step, cfg.warmup_steps, total_steps, cfg.lr)
-            for pg in opt.param_groups:
-                pg["lr"] = lr
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
 
-            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=DEVICE.type == "cuda"):
+            with maybe_autocast(device):
                 logits = model(x)
                 loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
 
             scaler.scale(loss).backward()
-            scaler.unscale_(opt)
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            scaler.step(opt)
+            scaler.step(optimizer)
             scaler.update()
-            opt.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
 
-            train_losses.append(loss.item())
+            sync_device(device)
+            batch_time = time.perf_counter() - batch_start
+            tokens = y.numel()
+
             step += 1
+            interval_tokens += tokens
+            interval_steps += 1
+            interval_train_time += batch_time
+            total_tokens_seen += tokens
+            history["train_steps"].append(step)
+            history["train_loss"].append(loss.item())
+            history["step_time_sec"].append(batch_time)
 
-            if step % cfg.eval_every == 0:
-                val_loss = evaluate(model, val_loader)
-                val_losses.append(val_loss)
-                val_steps.append(step)
-                pbar.set_postfix(loss=f"{loss.item():.3f}", val=f"{val_loss:.3f}", lr=f"{lr:.1e}")
+            if show_progress_bar:
+                iterator.set_postfix(loss=f"{loss.item():.3f}", lr=f"{lr:.1e}")
 
-    val_loss = evaluate(model, val_loader)
-    val_losses.append(val_loss)
-    val_steps.append(step)
-    print(f"[{label}] done — final val loss {val_loss:.4f}  ppl {math.exp(val_loss):.1f}")
-    return {"train": train_losses, "val": val_losses, "val_steps": val_steps}
+            if step % cfg.eval_every == 0 or step == total_steps:
+                val_loss, eval_time_sec = evaluate(model, val_loader, device)
+                elapsed_sec = time.perf_counter() - train_start
+                avg_step_time_sec = interval_train_time / max(interval_steps, 1)
+                tokens_per_sec = interval_tokens / max(interval_train_time, 1e-9)
+
+                history["val_steps"].append(step)
+                history["val_loss"].append(val_loss)
+                history["val_elapsed_sec"].append(elapsed_sec)
+                history["tokens_per_sec"].append(tokens_per_sec)
+
+                if show_progress_bar:
+                    iterator.set_postfix(
+                        loss=f"{loss.item():.3f}",
+                        val=f"{val_loss:.3f}",
+                        step=f"{avg_step_time_sec:.2f}s",
+                    )
+
+                print(
+                    f"[{label}] step {step}/{total_steps} | train {loss.item():.4f} | val {val_loss:.4f} | "
+                    f"elapsed {elapsed_sec / 60.0:.1f} min | step {avg_step_time_sec:.2f}s | "
+                    f"{tokens_per_sec:.0f} tok/s | eval {eval_time_sec:.2f}s"
+                )
+
+                if progress_callback is not None:
+                    progress_callback(
+                        progress_snapshot(
+                            label=label,
+                            history=history,
+                            step=step,
+                            total_steps=total_steps,
+                            epoch=epoch,
+                            lr=lr,
+                            train_loss=loss.item(),
+                            val_loss=val_loss,
+                            elapsed_sec=elapsed_sec,
+                            avg_step_time_sec=avg_step_time_sec,
+                            tokens_per_sec=tokens_per_sec,
+                            eval_time_sec=eval_time_sec,
+                        )
+                    )
+
+                interval_tokens = 0
+                interval_steps = 0
+                interval_train_time = 0.0
+
+    final_val = history["val_loss"][-1]
+    total_train_time_sec = time.perf_counter() - train_start
+    avg_step_time_sec = sum(history["step_time_sec"]) / max(len(history["step_time_sec"]), 1)
+    avg_tokens_per_sec = total_tokens_seen / max(sum(history["step_time_sec"]), 1e-9)
+    history["summary"] = {
+        "final_val_loss": final_val,
+        "final_val_ppl": math.exp(final_val),
+        "best_val_loss": min(history["val_loss"]),
+        "total_train_time_sec": total_train_time_sec,
+        "avg_step_time_sec": avg_step_time_sec,
+        "avg_tokens_per_sec": avg_tokens_per_sec,
+    }
+    print(
+        f"[{label}] done | final val {final_val:.4f} | ppl {math.exp(final_val):.2f} | "
+        f"total {total_train_time_sec / 60.0:.1f} min"
+    )
+    return history
 
 
-# ============================================================
-# Main
-# ============================================================
-def main():
-    cfg = CFG
-    out_dir = os.environ.get("NSA_OUTPUT_DIR", ".")
-    os.makedirs(out_dir, exist_ok=True)
-    torch.manual_seed(cfg.seed)
+def build_models(cfg: ExperimentConfig, device: torch.device) -> tuple[SmallLM, SmallLM]:
+    set_seed(cfg.seed)
+    base_full = SmallLM(cfg, FullAttention)
+    model_full = copy.deepcopy(base_full)
+    model_nsa = SmallLM(cfg, ReferenceNativeSparseAttention)
+    copied = copy_matching_state(base_full, model_nsa)
+    if cfg.zero_init_nsa_gates:
+        init_nsa_gates(model_nsa)
+    print(f"Copied {copied} shared tensors from full-attention init to NSA init")
+    return model_full.to(device), model_nsa.to(device)
 
-    # ---- data ----
-    train_t, val_t = load_data(cfg)
-    g = torch.Generator().manual_seed(cfg.seed)
-    train_loader = DataLoader(TensorDataset(train_t), batch_size=cfg.batch_size, shuffle=True,  generator=g)
-    val_loader   = DataLoader(TensorDataset(val_t),   batch_size=cfg.batch_size, shuffle=False)
 
-    # ---- Full Attention ----
-    print("\n========== Full Attention ==========")
-    torch.manual_seed(cfg.seed)
-    model_full = SmallLM(cfg, FullAttention).to(DEVICE)
-    print(f"  params: {model_full.param_count():,}")
-    res_full = train_model(model_full, train_loader, val_loader, cfg, label="FullAttn")
+def plot_results(results: dict[str, Any], out_path: Optional[Path] = None):
+    import matplotlib.pyplot as plt
 
-    # ---- NSA ----
-    print("\n========== NSA ==========")
-    torch.manual_seed(cfg.seed)
-    g = torch.Generator().manual_seed(cfg.seed)
-    train_loader = DataLoader(TensorDataset(train_t), batch_size=cfg.batch_size, shuffle=True, generator=g)
-    model_nsa = SmallLM(cfg, NSAAttention).to(DEVICE)
-    print(f"  params: {model_nsa.param_count():,}")
-    res_nsa = train_model(model_nsa, train_loader, val_loader, cfg, label="NSA")
+    cfg_dict = results["config"]
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    labels = [
+        ("full_attention", "Full Attention"),
+        ("nsa", "NSA (PyTorch)"),
+    ]
 
-    # ---- plots ----
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
+    for key, label in labels:
+        history = results[key]
+        axes[0].plot(
+            history["train_steps"],
+            smooth_curve(history["train_loss"], cfg_dict["smoothing_window"]),
+            label=label,
+            alpha=0.9,
+        )
+        axes[1].plot(history["val_steps"], history["val_loss"], "o-", label=label)
+        axes[2].plot(
+            [elapsed / 60.0 for elapsed in history["val_elapsed_sec"]],
+            history["val_loss"],
+            "o-",
+            label=label,
+        )
 
-    # smoothed training loss
-    def smooth(vals, w=50):
-        out = []
-        for i in range(len(vals)):
-            lo = max(0, i - w)
-            out.append(sum(vals[lo:i+1]) / (i + 1 - lo))
-        return out
+    axes[0].set_title("Training Loss")
+    axes[0].set_xlabel("Step")
+    axes[0].set_ylabel("Loss")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
 
-    ax1.plot(smooth(res_full["train"]), label="Full Attention", alpha=0.85)
-    ax1.plot(smooth(res_nsa["train"]),  label="NSA",            alpha=0.85)
-    ax1.set_xlabel("Training step")
-    ax1.set_ylabel("Loss (cross-entropy)")
-    ax1.set_title("Training Loss (smoothed)")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+    axes[1].set_title("Validation Loss vs Step")
+    axes[1].set_xlabel("Step")
+    axes[1].set_ylabel("Validation Loss")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
 
-    ax2.plot(res_full["val_steps"], res_full["val"], "o-", label="Full Attention")
-    ax2.plot(res_nsa["val_steps"],  res_nsa["val"],  "s-", label="NSA")
-    ax2.set_xlabel("Training step")
-    ax2.set_ylabel("Validation Loss")
-    ax2.set_title("Validation Loss")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    axes[2].set_title("Validation Loss vs Elapsed Time")
+    axes[2].set_xlabel("Elapsed time (minutes)")
+    axes[2].set_ylabel("Validation Loss")
+    axes[2].grid(True, alpha=0.3)
+    axes[2].legend()
 
     plt.tight_layout()
-    fig_path = os.path.join(out_dir, "nsa_vs_full.png")
-    plt.savefig(fig_path, dpi=150)
-    plt.close()
-    print(f"Plot saved → {fig_path}")
+    if out_path is not None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(out_path, dpi=150)
+    return fig
 
-    # ---- save numbers ----
-    json_path = os.path.join(out_dir, "results.json")
-    with open(json_path, "w") as f:
-        json.dump({
-            "full_attention": {
-                "final_val_loss": res_full["val"][-1],
-                "final_val_ppl":  math.exp(res_full["val"][-1]),
-            },
-            "nsa": {
-                "final_val_loss": res_nsa["val"][-1],
-                "final_val_ppl":  math.exp(res_nsa["val"][-1]),
-            },
-        }, f, indent=2)
-    print(f"Numbers saved → {json_path}")
+
+def save_results(results: dict[str, Any], output_dir: str | Path) -> tuple[Path, Path]:
+    import matplotlib.pyplot as plt
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig_path = out_dir / "nsa_vs_full.png"
+    json_path = out_dir / "results.json"
+
+    fig = plot_results(results, fig_path)
+    plt.close(fig)
+
+    with json_path.open("w", encoding="utf-8") as handle:
+        json.dump(results, handle, indent=2)
+
+    return fig_path, json_path
+
+
+def run_experiment(
+    cfg: Optional[ExperimentConfig] = None,
+    output_dir: Optional[str | Path] = None,
+    progress_callback: Optional[ProgressCallback] = None,
+    show_progress_bar: bool = True,
+) -> dict[str, Any]:
+    cfg = cfg or ExperimentConfig()
+    device = get_device(cfg.device)
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+
+    print(f"Device: {device}")
+    print(f"Config: {cfg}")
+
+    train_tokens, val_tokens = load_data(cfg)
+    val_loader = make_loader(val_tokens, cfg.batch_size, shuffle=False, seed=cfg.seed)
+
+    model_full, model_nsa = build_models(cfg, device)
+    print(f"Full Attention params: {model_full.param_count():,}")
+    print(f"NSA params: {model_nsa.param_count():,}")
+
+    full_loader = make_loader(train_tokens, cfg.batch_size, shuffle=True, seed=cfg.seed)
+    nsa_loader = make_loader(train_tokens, cfg.batch_size, shuffle=True, seed=cfg.seed)
+
+    print("\n========== Full Attention ==========")
+    res_full = train_model(
+        model_full,
+        full_loader,
+        val_loader,
+        cfg,
+        device,
+        label="FullAttn",
+        progress_callback=progress_callback,
+        show_progress_bar=show_progress_bar,
+    )
+
+    del model_full
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    print("\n========== NSA ==========")
+    res_nsa = train_model(
+        model_nsa,
+        nsa_loader,
+        val_loader,
+        cfg,
+        device,
+        label="NSA",
+        progress_callback=progress_callback,
+        show_progress_bar=show_progress_bar,
+    )
+
+    results = {
+        "config": asdict(cfg),
+        "device": str(device),
+        "dataset": {
+            "train_chunks": len(train_tokens),
+            "val_chunks": len(val_tokens),
+            "seq_len": cfg.max_seq_len,
+        },
+        "full_attention": res_full,
+        "nsa": res_nsa,
+        "summary": {
+            "full_attention": res_full["summary"],
+            "nsa": res_nsa["summary"],
+        },
+    }
+
+    if output_dir is not None:
+        fig_path, json_path = save_results(results, output_dir)
+        print(f"Saved plot to {fig_path}")
+        print(f"Saved metrics to {json_path}")
+
+    return results
+
+
+def main() -> None:
+    output_dir = os.environ.get("NSA_OUTPUT_DIR", "outputs")
+    run_experiment(output_dir=output_dir, show_progress_bar=True)
 
 
 if __name__ == "__main__":
