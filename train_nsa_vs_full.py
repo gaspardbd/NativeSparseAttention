@@ -12,7 +12,8 @@ Combined via learned sigmoid gates, compared against standard causal attention.
 
 Usage on Colab:
   1.  !pip install -q datasets transformers matplotlib tqdm
-  2.  Copy-paste this file or upload & run:  !python train_nsa_vs_full.py
+  2.  Optional: export NSA_OUTPUT_DIR=/path/to/outputs  (default: current dir)
+  3.  python train_nsa_vs_full.py
 """
 
 import math
@@ -20,6 +21,10 @@ import time
 import copy
 import json
 import os
+
+import matplotlib
+
+matplotlib.use("Agg")  # headless (Colab subprocess, serveurs sans display)
 
 import torch
 import torch.nn as nn
@@ -403,6 +408,8 @@ def train_model(model, train_loader, val_loader, cfg, label="model"):
 # ============================================================
 def main():
     cfg = CFG
+    out_dir = os.environ.get("NSA_OUTPUT_DIR", ".")
+    os.makedirs(out_dir, exist_ok=True)
     torch.manual_seed(cfg.seed)
 
     # ---- data ----
@@ -455,12 +462,14 @@ def main():
     ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig("nsa_vs_full.png", dpi=150)
-    plt.show()
-    print("Plot saved → nsa_vs_full.png")
+    fig_path = os.path.join(out_dir, "nsa_vs_full.png")
+    plt.savefig(fig_path, dpi=150)
+    plt.close()
+    print(f"Plot saved → {fig_path}")
 
     # ---- save numbers ----
-    with open("results.json", "w") as f:
+    json_path = os.path.join(out_dir, "results.json")
+    with open(json_path, "w") as f:
         json.dump({
             "full_attention": {
                 "final_val_loss": res_full["val"][-1],
@@ -471,7 +480,7 @@ def main():
                 "final_val_ppl":  math.exp(res_nsa["val"][-1]),
             },
         }, f, indent=2)
-    print("Numbers saved → results.json")
+    print(f"Numbers saved → {json_path}")
 
 
 if __name__ == "__main__":
