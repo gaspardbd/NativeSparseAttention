@@ -450,6 +450,17 @@ def smooth_curve(values: list[float], window: int) -> list[float]:
     return smoothed
 
 
+def validation_plot_kwargs(num_points: int) -> dict[str, Any]:
+    markevery = max(1, num_points // 20)
+    return {
+        "linestyle": "-",
+        "marker": "o",
+        "markersize": 2.5,
+        "markevery": markevery,
+        "linewidth": 1.5,
+    }
+
+
 def maybe_autocast(device: torch.device):
     if device.type == "cuda":
         return torch.autocast(device_type="cuda", dtype=torch.float16)
@@ -771,13 +782,18 @@ def plot_results(results: dict[str, Any], out_path: Optional[Path] = None):
             label=label,
             alpha=0.9,
         )
-        axes[1].plot(history["val_steps"], history["val_loss"], "o-", label=label)
+        axes[1].plot(
+            history["val_steps"],
+            history["val_loss"],
+            label=label,
+            **validation_plot_kwargs(len(history["val_steps"])),
+        )
         if show_elapsed:
             axes[2].plot(
                 [elapsed / 60.0 for elapsed in history["val_elapsed_sec"]],
                 history["val_loss"],
-                "o-",
                 label=label,
+                **validation_plot_kwargs(len(history["val_elapsed_sec"])),
             )
 
     axes[0].set_title("Training Loss")
