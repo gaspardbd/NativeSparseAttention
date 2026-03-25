@@ -12,9 +12,10 @@ import json
 import math
 import os
 import random
+import subprocess
 import time
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -67,6 +68,8 @@ class ExperimentConfig:
     smoothing_window: int = 20
     zero_init_nsa_gates: bool = True
     show_elapsed_time_plot: bool = False
+    compare_nsa_branches: bool = False
+    nsa_mode: str = "all"
     device: Optional[str] = None
 
     @property
@@ -275,6 +278,106 @@ def get_device_info(device: torch.device) -> dict[str, Any]:
     return info
 
 
+def get_model_specs(cfg: ExperimentConfig) -> list[dict[str, str]]:
+    specs = [
+        {
+            "key": "full_attention",
+            "label": "Full Attention",
+            "progress_label": "FullAttn",
+            "kind": "full",
+        },
+        {
+            "key": "nsa",
+            "label": "NSA (All)",
+            "progress_label": "NSA",
+            "kind": "nsa",
+            "nsa_mode": "all",
+        },
+    ]
+    if cfg.compare_nsa_branches:
+        specs.extend(
+            [
+                {
+                    "key": "nsa_compression",
+                    "label": "NSA Compression",
+                    "progress_label": "NSA-Cmp",
+                    "kind": "nsa",
+                    "nsa_mode": "compression",
+                },
+                {
+                    "key": "nsa_selection",
+                    "label": "NSA Selection",
+                    "progress_label": "NSA-Slc",
+                    "kind": "nsa",
+                    "nsa_mode": "selection",
+                },
+                {
+                    "key": "nsa_sliding",
+                    "label": "NSA Sliding",
+                    "progress_label": "NSA-Swa",
+                    "kind": "nsa",
+                    "nsa_mode": "sliding",
+                },
+            ]
+        )
+    return specs
+
+
+def format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def query_nvidia_smi(device: torch.device) -> dict[str, Any]:
+    if device.type != "cuda":
+        return {}
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,utilization.gpu,memory.used,memory.total,temperature.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except Exception:
+        return {}
+
+    for line in result.stdout.strip().splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 5:
+            continue
+        index, util, mem_used, mem_total, temperature = parts
+        if int(index) == device_index:
+            return {
+                "gpu_util_pct": float(util),
+                "gpu_mem_used_mb": float(mem_used),
+                "gpu_mem_total_mb": float(mem_total),
+                "gpu_temperature_c": float(temperature),
+            }
+    return {}
+
+
+def get_runtime_stats(device: torch.device) -> dict[str, Any]:
+    if device.type != "cuda":
+        return {}
+
+    stats = {
+        "torch_mem_allocated_gb": round(torch.cuda.memory_allocated(device) / (1024 ** 3), 3),
+        "torch_mem_reserved_gb": round(torch.cuda.memory_reserved(device) / (1024 ** 3), 3),
+        "torch_max_mem_allocated_gb": round(torch.cuda.max_memory_allocated(device) / (1024 ** 3), 3),
+    }
+    stats.update(query_nvidia_smi(device))
+    return stats
+
+
 def sync_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -408,6 +511,8 @@ def progress_snapshot(
     avg_step_time_sec: float,
     tokens_per_sec: float,
     eval_time_sec: float,
+    eta_sec: float,
+    runtime_stats: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "label": label,
@@ -421,6 +526,8 @@ def progress_snapshot(
         "avg_step_time_sec": avg_step_time_sec,
         "tokens_per_sec": tokens_per_sec,
         "eval_time_sec": eval_time_sec,
+        "eta_sec": eta_sec,
+        "runtime_stats": dict(runtime_stats),
         "history": {
             "train_steps": history["train_steps"][:],
             "train_loss": history["train_loss"][:],
@@ -463,7 +570,11 @@ def train_model(
         "val_elapsed_sec": [],
         "step_time_sec": [],
         "tokens_per_sec": [],
+        "runtime_stats": [],
     }
+
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     train_start = time.perf_counter()
     step = 0
@@ -476,6 +587,7 @@ def train_model(
     history["val_steps"].append(0)
     history["val_loss"].append(val_loss)
     history["val_elapsed_sec"].append(0.0)
+    history["runtime_stats"].append(get_runtime_stats(device))
     if progress_callback is not None:
         progress_callback(
             progress_snapshot(
@@ -491,6 +603,8 @@ def train_model(
                 avg_step_time_sec=0.0,
                 tokens_per_sec=0.0,
                 eval_time_sec=eval_time_sec,
+                eta_sec=0.0,
+                runtime_stats=history["runtime_stats"][-1],
             )
         )
     print(f"[{label}] step 0/{total_steps} | val {val_loss:.4f} | ppl {math.exp(val_loss):.2f}")
@@ -546,11 +660,14 @@ def train_model(
                 elapsed_sec = time.perf_counter() - train_start
                 avg_step_time_sec = interval_train_time / max(interval_steps, 1)
                 tokens_per_sec = interval_tokens / max(interval_train_time, 1e-9)
+                eta_sec = (elapsed_sec / max(step, 1)) * max(total_steps - step, 0)
+                runtime_stats = get_runtime_stats(device)
 
                 history["val_steps"].append(step)
                 history["val_loss"].append(val_loss)
                 history["val_elapsed_sec"].append(elapsed_sec)
                 history["tokens_per_sec"].append(tokens_per_sec)
+                history["runtime_stats"].append(runtime_stats)
 
                 if show_progress_bar:
                     iterator.set_postfix(
@@ -561,8 +678,9 @@ def train_model(
 
                 print(
                     f"[{label}] step {step}/{total_steps} | train {loss.item():.4f} | val {val_loss:.4f} | "
-                    f"elapsed {elapsed_sec / 60.0:.1f} min | step {avg_step_time_sec:.2f}s | "
-                    f"{tokens_per_sec:.0f} tok/s | eval {eval_time_sec:.2f}s"
+                    f"elapsed {format_duration(elapsed_sec)} | eta {format_duration(eta_sec)} | "
+                    f"step {avg_step_time_sec:.2f}s | {tokens_per_sec:.0f} tok/s | "
+                    f"gpu_mem {runtime_stats.get('torch_mem_allocated_gb', 0.0):.2f} GB | eval {eval_time_sec:.2f}s"
                 )
 
                 if progress_callback is not None:
@@ -580,6 +698,8 @@ def train_model(
                             avg_step_time_sec=avg_step_time_sec,
                             tokens_per_sec=tokens_per_sec,
                             eval_time_sec=eval_time_sec,
+                            eta_sec=eta_sec,
+                            runtime_stats=runtime_stats,
                         )
                     )
 
@@ -598,6 +718,7 @@ def train_model(
         "total_train_time_sec": total_train_time_sec,
         "avg_step_time_sec": avg_step_time_sec,
         "avg_tokens_per_sec": avg_tokens_per_sec,
+        "final_runtime_stats": history["runtime_stats"][-1] if history["runtime_stats"] else {},
     }
     print(
         f"[{label}] done | final val {final_val:.4f} | ppl {math.exp(final_val):.2f} | "
@@ -606,16 +727,30 @@ def train_model(
     return history
 
 
-def build_models(cfg: ExperimentConfig, device: torch.device) -> tuple[SmallLM, SmallLM]:
+def build_base_full_model(cfg: ExperimentConfig) -> SmallLM:
     set_seed(cfg.seed)
-    base_full = SmallLM(cfg, FullAttention)
-    model_full = copy.deepcopy(base_full)
-    model_nsa = SmallLM(cfg, ReferenceNativeSparseAttention)
-    copied = copy_matching_state(base_full, model_nsa)
-    if cfg.zero_init_nsa_gates:
-        init_nsa_gates(model_nsa)
-    print(f"Copied {copied} shared tensors from full-attention init to NSA init")
-    return model_full.to(device), model_nsa.to(device)
+    return SmallLM(cfg, FullAttention)
+
+
+def build_model_from_spec(
+    base_full: SmallLM,
+    cfg: ExperimentConfig,
+    spec: dict[str, str],
+    device: torch.device,
+) -> SmallLM:
+    if spec["kind"] == "full":
+        model = copy.deepcopy(base_full)
+    else:
+        model_cfg = replace(cfg, nsa_mode=spec["nsa_mode"])
+        model = SmallLM(model_cfg, ReferenceNativeSparseAttention)
+        copied = copy_matching_state(base_full, model)
+        if cfg.zero_init_nsa_gates:
+            init_nsa_gates(model)
+        print(
+            f"Copied {copied} shared tensors from full-attention init to {spec['label']} "
+            f"(mode={spec['nsa_mode']})"
+        )
+    return model.to(device)
 
 
 def plot_results(results: dict[str, Any], out_path: Optional[Path] = None):
@@ -627,13 +762,9 @@ def plot_results(results: dict[str, Any], out_path: Optional[Path] = None):
     fig, axes = plt.subplots(1, num_cols, figsize=(6 * num_cols, 5))
     if num_cols == 1:
         axes = [axes]
-    labels = [
-        ("full_attention", "Full Attention"),
-        ("nsa", "NSA (PyTorch)"),
-    ]
-
-    for key, label in labels:
-        history = results[key]
+    for key in results["model_order"]:
+        history = results["models"][key]
+        label = history["plot_label"]
         axes[0].plot(
             history["train_steps"],
             smooth_curve(history["train_loss"], cfg_dict["smoothing_window"]),
@@ -710,41 +841,35 @@ def run_experiment(
 
     train_tokens, val_tokens = load_data(cfg)
     val_loader = make_loader(val_tokens, cfg.batch_size, shuffle=False, seed=cfg.seed)
+    specs = get_model_specs(cfg)
+    base_full = build_base_full_model(cfg)
+    results_models: dict[str, Any] = {}
+    summary: dict[str, Any] = {}
 
-    model_full, model_nsa = build_models(cfg, device)
-    print(f"Full Attention params: {model_full.param_count():,}")
-    print(f"NSA params: {model_nsa.param_count():,}")
+    for spec in specs:
+        print(f"\n========== {spec['label']} ==========")
+        model = build_model_from_spec(base_full, cfg, spec, device)
+        print(f"{spec['label']} params: {model.param_count():,}")
 
-    full_loader = make_loader(train_tokens, cfg.batch_size, shuffle=True, seed=cfg.seed)
-    nsa_loader = make_loader(train_tokens, cfg.batch_size, shuffle=True, seed=cfg.seed)
+        train_loader = make_loader(train_tokens, cfg.batch_size, shuffle=True, seed=cfg.seed)
+        result = train_model(
+            model,
+            train_loader,
+            val_loader,
+            cfg,
+            device,
+            label=spec["progress_label"],
+            progress_callback=progress_callback,
+            show_progress_bar=show_progress_bar,
+        )
+        result["plot_label"] = spec["label"]
+        result["model_key"] = spec["key"]
+        results_models[spec["key"]] = result
+        summary[spec["key"]] = result["summary"]
 
-    print("\n========== Full Attention ==========")
-    res_full = train_model(
-        model_full,
-        full_loader,
-        val_loader,
-        cfg,
-        device,
-        label="FullAttn",
-        progress_callback=progress_callback,
-        show_progress_bar=show_progress_bar,
-    )
-
-    del model_full
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    print("\n========== NSA ==========")
-    res_nsa = train_model(
-        model_nsa,
-        nsa_loader,
-        val_loader,
-        cfg,
-        device,
-        label="NSA",
-        progress_callback=progress_callback,
-        show_progress_bar=show_progress_bar,
-    )
+        del model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     results = {
         "config": asdict(cfg),
@@ -755,13 +880,14 @@ def run_experiment(
             "val_chunks": len(val_tokens),
             "seq_len": cfg.max_seq_len,
         },
-        "full_attention": res_full,
-        "nsa": res_nsa,
-        "summary": {
-            "full_attention": res_full["summary"],
-            "nsa": res_nsa["summary"],
-        },
+        "model_order": [spec["key"] for spec in specs],
+        "models": results_models,
+        "summary": summary,
     }
+    if "full_attention" in results_models:
+        results["full_attention"] = results_models["full_attention"]
+    if "nsa" in results_models:
+        results["nsa"] = results_models["nsa"]
 
     if output_dir is not None:
         fig_path, json_path = save_results(results, output_dir)

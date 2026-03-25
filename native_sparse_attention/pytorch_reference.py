@@ -46,6 +46,10 @@ class ReferenceNativeSparseAttention(nn.Module):
         self.block_size = cfg.block_size
         self.block_counts = cfg.block_counts
         self.window_size = cfg.window_size
+        self.mode = getattr(cfg, "nsa_mode", "all")
+        valid_modes = {"all", "compression", "selection", "sliding"}
+        if self.mode not in valid_modes:
+            raise ValueError(f"Invalid nsa_mode={self.mode!r}. Expected one of {sorted(valid_modes)}")
 
         self.q_proj = nn.Linear(dim, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(dim, self.num_heads * self.head_dim, bias=False)
@@ -80,53 +84,80 @@ class ReferenceNativeSparseAttention(nn.Module):
             k_padded = k
             v_padded = v
 
-        k_cmp = k_padded.reshape(batch_size, num_heads, num_blocks, block_size, head_dim).mean(dim=3)
-        v_cmp = v_padded.reshape(batch_size, num_heads, num_blocks, block_size, head_dim).mean(dim=3)
+        use_cmp = self.mode in {"all", "compression", "selection"}
+        use_slc = self.mode in {"all", "selection"}
+        use_swa = self.mode in {"all", "sliding"}
 
-        att_cmp = torch.matmul(q, k_cmp.transpose(-1, -2)) * self.scale
-        block_idx = torch.arange(num_blocks, device=x.device)
-        block_end = ((block_idx + 1) * block_size - 1).clamp(max=seq_len - 1)
-        cmp_ok = token_idx.unsqueeze(1) >= block_end.unsqueeze(0)
-        att_cmp = att_cmp.masked_fill(~cmp_ok.unsqueeze(0).unsqueeze(0), float("-inf"))
-        w_cmp = F.softmax(att_cmp, dim=-1).nan_to_num(0.0)
-        o_cmp = torch.matmul(self.attn_drop(w_cmp), v_cmp)
+        if use_cmp:
+            k_cmp = k_padded.reshape(batch_size, num_heads, num_blocks, block_size, head_dim).mean(dim=3)
+            v_cmp = v_padded.reshape(batch_size, num_heads, num_blocks, block_size, head_dim).mean(dim=3)
 
-        block_scores = w_cmp.detach().clone()
-        local_block = token_idx // block_size
-        is_local_block = block_idx.unsqueeze(0) == local_block.unsqueeze(1)
-        block_scores = block_scores.masked_fill(is_local_block.unsqueeze(0).unsqueeze(0), 1.0)
+            att_cmp = torch.matmul(q, k_cmp.transpose(-1, -2)) * self.scale
+            block_idx = torch.arange(num_blocks, device=x.device)
+            block_end = ((block_idx + 1) * block_size - 1).clamp(max=seq_len - 1)
+            cmp_ok = token_idx.unsqueeze(1) >= block_end.unsqueeze(0)
+            att_cmp = att_cmp.masked_fill(~cmp_ok.unsqueeze(0).unsqueeze(0), float("-inf"))
+            w_cmp = F.softmax(att_cmp, dim=-1).nan_to_num(0.0)
+            o_cmp = torch.matmul(self.attn_drop(w_cmp), v_cmp)
+        else:
+            block_idx = torch.arange(num_blocks, device=x.device)
+            w_cmp = None
+            o_cmp = torch.zeros_like(v)
 
-        topk = min(self.block_counts, num_blocks)
-        top_blocks = block_scores.topk(topk, dim=-1).indices
-        selected_blocks = torch.zeros(
-            batch_size,
-            num_heads,
-            seq_len,
-            num_blocks,
-            dtype=torch.bool,
-            device=x.device,
-        )
-        selected_blocks.scatter_(3, top_blocks, True)
-        token_block = token_idx // block_size
-        selection_mask = selected_blocks[..., token_block]
-        causal_mask = token_idx.unsqueeze(0) <= token_idx.unsqueeze(1)
-        selection_mask = selection_mask & causal_mask.unsqueeze(0).unsqueeze(0)
+        att_raw = None
+        if use_slc or use_swa:
+            att_raw = torch.matmul(q, k.transpose(-1, -2)) * self.scale
 
-        att_raw = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        att_slc = att_raw.masked_fill(~selection_mask, float("-inf"))
-        w_slc = F.softmax(att_slc, dim=-1).nan_to_num(0.0)
-        o_slc = torch.matmul(self.attn_drop(w_slc), v)
+        if use_slc:
+            if w_cmp is None:
+                raise RuntimeError("Selection branch requires compression scores")
+            block_scores = w_cmp.detach().clone()
+            local_block = token_idx // block_size
+            is_local_block = block_idx.unsqueeze(0) == local_block.unsqueeze(1)
+            block_scores = block_scores.masked_fill(is_local_block.unsqueeze(0).unsqueeze(0), 1.0)
 
-        token_distance = token_idx.unsqueeze(1) - token_idx.unsqueeze(0)
-        sliding_mask = (token_distance >= 0) & (token_distance < self.window_size)
-        att_swa = att_raw.masked_fill(~sliding_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-        w_swa = F.softmax(att_swa, dim=-1).nan_to_num(0.0)
-        o_swa = torch.matmul(self.attn_drop(w_swa), v)
+            topk = min(self.block_counts, num_blocks)
+            top_blocks = block_scores.topk(topk, dim=-1).indices
+            selected_blocks = torch.zeros(
+                batch_size,
+                num_heads,
+                seq_len,
+                num_blocks,
+                dtype=torch.bool,
+                device=x.device,
+            )
+            selected_blocks.scatter_(3, top_blocks, True)
+            token_block = token_idx // block_size
+            selection_mask = selected_blocks[..., token_block]
+            causal_mask = token_idx.unsqueeze(0) <= token_idx.unsqueeze(1)
+            selection_mask = selection_mask & causal_mask.unsqueeze(0).unsqueeze(0)
 
-        out = (
-            g_cmp.unsqueeze(-1) * o_cmp
-            + g_slc.unsqueeze(-1) * o_slc
-            + g_swa.unsqueeze(-1) * o_swa
-        )
+            att_slc = att_raw.masked_fill(~selection_mask, float("-inf"))
+            w_slc = F.softmax(att_slc, dim=-1).nan_to_num(0.0)
+            o_slc = torch.matmul(self.attn_drop(w_slc), v)
+        else:
+            o_slc = torch.zeros_like(v)
+
+        if use_swa:
+            token_distance = token_idx.unsqueeze(1) - token_idx.unsqueeze(0)
+            sliding_mask = (token_distance >= 0) & (token_distance < self.window_size)
+            att_swa = att_raw.masked_fill(~sliding_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+            w_swa = F.softmax(att_swa, dim=-1).nan_to_num(0.0)
+            o_swa = torch.matmul(self.attn_drop(w_swa), v)
+        else:
+            o_swa = torch.zeros_like(v)
+
+        if self.mode == "compression":
+            out = g_cmp.unsqueeze(-1) * o_cmp
+        elif self.mode == "selection":
+            out = g_slc.unsqueeze(-1) * o_slc
+        elif self.mode == "sliding":
+            out = g_swa.unsqueeze(-1) * o_swa
+        else:
+            out = (
+                g_cmp.unsqueeze(-1) * o_cmp
+                + g_slc.unsqueeze(-1) * o_slc
+                + g_swa.unsqueeze(-1) * o_swa
+            )
         out = out.transpose(1, 2).reshape(batch_size, seq_len, -1)
         return self.o_proj(out)
