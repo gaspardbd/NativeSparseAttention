@@ -1,14 +1,19 @@
 # -*- coding: utf-8 -*-
 
-from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
-
-from native_sparse_attention.configuration_nsa import NSAConfig
-from native_sparse_attention.modeling_nsa import NSAForCausalLM, NSAModel
 from native_sparse_attention.ops.parallel import parallel_nsa
 
-AutoConfig.register(NSAConfig.model_type, NSAConfig)
-AutoModel.register(NSAConfig, NSAModel)
-AutoModelForCausalLM.register(NSAConfig, NSAForCausalLM)
+try:
+    from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+    from native_sparse_attention.configuration_nsa import NSAConfig
+    from native_sparse_attention.modeling_nsa import NSAForCausalLM, NSAModel
+
+    AutoConfig.register(NSAConfig.model_type, NSAConfig)
+    AutoModel.register(NSAConfig, NSAModel)
+    AutoModelForCausalLM.register(NSAConfig, NSAForCausalLM)
+except Exception:
+    NSAConfig = None
+    NSAModel = None
+    NSAForCausalLM = None
 
 
 __all__ = [
