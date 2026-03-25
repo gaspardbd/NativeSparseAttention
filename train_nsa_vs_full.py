@@ -66,6 +66,7 @@ class ExperimentConfig:
     max_val_chunks: int = 128
     smoothing_window: int = 20
     zero_init_nsa_gates: bool = True
+    show_elapsed_time_plot: bool = False
     device: Optional[str] = None
 
     @property
@@ -73,6 +74,64 @@ class ExperimentConfig:
         if self.hidden_size % self.num_heads != 0:
             raise ValueError("hidden_size must be divisible by num_heads")
         return self.hidden_size // self.num_heads
+
+
+EXPERIMENT_PRESETS: dict[str, dict[str, Any]] = {
+    "quick": {
+        "hidden_size": 256,
+        "num_heads": 8,
+        "num_layers": 4,
+        "mlp_hidden": 1024,
+        "max_seq_len": 256,
+        "batch_size": 8,
+        "epochs": 2,
+        "eval_every": 20,
+        "max_train_chunks": 512,
+        "max_val_chunks": 128,
+        "block_size": 32,
+        "block_counts": 4,
+        "window_size": 64,
+    },
+    "standard": {
+        "hidden_size": 256,
+        "num_heads": 8,
+        "num_layers": 4,
+        "mlp_hidden": 1024,
+        "max_seq_len": 256,
+        "batch_size": 8,
+        "epochs": 3,
+        "eval_every": 40,
+        "max_train_chunks": 1536,
+        "max_val_chunks": 256,
+        "block_size": 32,
+        "block_counts": 4,
+        "window_size": 64,
+    },
+    "representative": {
+        "hidden_size": 384,
+        "num_heads": 8,
+        "num_layers": 6,
+        "mlp_hidden": 1536,
+        "max_seq_len": 256,
+        "batch_size": 8,
+        "epochs": 3,
+        "eval_every": 50,
+        "max_train_chunks": 2048,
+        "max_val_chunks": 256,
+        "block_size": 32,
+        "block_counts": 4,
+        "window_size": 64,
+    },
+}
+
+
+def make_preset_config(preset: str = "standard", **overrides: Any) -> ExperimentConfig:
+    if preset not in EXPERIMENT_PRESETS:
+        valid = ", ".join(sorted(EXPERIMENT_PRESETS))
+        raise ValueError(f"Unknown preset {preset!r}. Valid presets: {valid}")
+    values = dict(EXPERIMENT_PRESETS[preset])
+    values.update(overrides)
+    return ExperimentConfig(**values)
 
 
 class RMSNorm(nn.Module):
@@ -193,6 +252,27 @@ def get_device(name: Optional[str] = None) -> torch.device:
     if name is not None:
         return torch.device(name)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def get_device_info(device: torch.device) -> dict[str, Any]:
+    info: dict[str, Any] = {
+        "device": str(device),
+        "torch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "cuda_version": torch.version.cuda,
+    }
+    if device.type == "cuda":
+        props = torch.cuda.get_device_properties(device)
+        info.update(
+            {
+                "gpu_name": props.name,
+                "gpu_total_memory_gb": round(props.total_memory / (1024 ** 3), 2),
+                "gpu_multiprocessors": props.multi_processor_count,
+                "gpu_compute_capability": f"{props.major}.{props.minor}",
+                "cudnn_enabled": torch.backends.cudnn.enabled,
+            }
+        )
+    return info
 
 
 def sync_device(device: torch.device) -> None:
@@ -542,7 +622,11 @@ def plot_results(results: dict[str, Any], out_path: Optional[Path] = None):
     import matplotlib.pyplot as plt
 
     cfg_dict = results["config"]
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    show_elapsed = cfg_dict.get("show_elapsed_time_plot", False)
+    num_cols = 3 if show_elapsed else 2
+    fig, axes = plt.subplots(1, num_cols, figsize=(6 * num_cols, 5))
+    if num_cols == 1:
+        axes = [axes]
     labels = [
         ("full_attention", "Full Attention"),
         ("nsa", "NSA (PyTorch)"),
@@ -557,12 +641,13 @@ def plot_results(results: dict[str, Any], out_path: Optional[Path] = None):
             alpha=0.9,
         )
         axes[1].plot(history["val_steps"], history["val_loss"], "o-", label=label)
-        axes[2].plot(
-            [elapsed / 60.0 for elapsed in history["val_elapsed_sec"]],
-            history["val_loss"],
-            "o-",
-            label=label,
-        )
+        if show_elapsed:
+            axes[2].plot(
+                [elapsed / 60.0 for elapsed in history["val_elapsed_sec"]],
+                history["val_loss"],
+                "o-",
+                label=label,
+            )
 
     axes[0].set_title("Training Loss")
     axes[0].set_xlabel("Step")
@@ -576,11 +661,12 @@ def plot_results(results: dict[str, Any], out_path: Optional[Path] = None):
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
 
-    axes[2].set_title("Validation Loss vs Elapsed Time")
-    axes[2].set_xlabel("Elapsed time (minutes)")
-    axes[2].set_ylabel("Validation Loss")
-    axes[2].grid(True, alpha=0.3)
-    axes[2].legend()
+    if show_elapsed:
+        axes[2].set_title("Validation Loss vs Elapsed Time")
+        axes[2].set_xlabel("Elapsed time (minutes)")
+        axes[2].set_ylabel("Validation Loss")
+        axes[2].grid(True, alpha=0.3)
+        axes[2].legend()
 
     plt.tight_layout()
     if out_path is not None:
@@ -614,10 +700,12 @@ def run_experiment(
 ) -> dict[str, Any]:
     cfg = cfg or ExperimentConfig()
     device = get_device(cfg.device)
+    device_info = get_device_info(device)
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
 
     print(f"Device: {device}")
+    print(f"Device info: {json.dumps(device_info, indent=2)}")
     print(f"Config: {cfg}")
 
     train_tokens, val_tokens = load_data(cfg)
@@ -661,6 +749,7 @@ def run_experiment(
     results = {
         "config": asdict(cfg),
         "device": str(device),
+        "device_info": device_info,
         "dataset": {
             "train_chunks": len(train_tokens),
             "val_chunks": len(val_tokens),
@@ -684,7 +773,9 @@ def run_experiment(
 
 def main() -> None:
     output_dir = os.environ.get("NSA_OUTPUT_DIR", "outputs")
-    run_experiment(output_dir=output_dir, show_progress_bar=True)
+    preset = os.environ.get("NSA_EXPERIMENT_PRESET", "standard")
+    cfg = make_preset_config(preset)
+    run_experiment(cfg=cfg, output_dir=output_dir, show_progress_bar=True)
 
 
 if __name__ == "__main__":
