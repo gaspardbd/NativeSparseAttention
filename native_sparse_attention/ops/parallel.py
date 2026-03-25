@@ -1384,9 +1384,10 @@ def parallel_nsa(
             block_counts = rearrange(block_counts, 'b h t -> b t h')
     assert q.shape[2] % (k.shape[2] * 16) == 0, "Group size must be a multiple of 16 in NSA"
 
-    k_cmp, v_cmp = mean_pooling(k, block_size, cu_seqlens), mean_pooling(v, block_size, cu_seqlens)
     o_cmp, lse_cmp = None, None
     if g_cmp is not None:
+        k_cmp = mean_pooling(k, block_size, cu_seqlens)
+        v_cmp = mean_pooling(v, block_size, cu_seqlens)
         o_cmp, lse_cmp = parallel_nsa_compression(
             q=q,
             k=k_cmp,
