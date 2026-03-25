@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 
-from native_sparse_attention.ops.parallel import parallel_nsa
+try:
+    from native_sparse_attention.ops.parallel import parallel_nsa
+except Exception:
+    parallel_nsa = None
 
 try:
     from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
